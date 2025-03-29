@@ -24,7 +24,7 @@ The primary goals of this project are:
 3. **Format Conversion**:
    - Convert between various video formats (MP4, MKV, WEBM, AVI, MOV)
    - Extract audio in multiple formats (MP3, WAV, AAC, OGG, FLAC, M4A)
-4. **Future Live Stream Support**:
+4. **Live Stream Support**:
    - Connect to YouTube live streams
    - Process and transcribe live streams in real-time
    - Extract valuable information while streams are happening

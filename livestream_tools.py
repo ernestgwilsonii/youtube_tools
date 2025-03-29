@@ -19,13 +19,13 @@ import logging
 import threading
 import tempfile
 import queue
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Generator
 
 import yt_dlp
 import speech_recognition as sr
 from pydub import AudioSegment
-import ffmpeg
 
 # Configure logging
 logging.basicConfig(
@@ -219,17 +219,22 @@ class LiveStreamTranscriber:
             while self.is_running:
                 # Capture a chunk of audio using ffmpeg
                 try:
-                    # Use ffmpeg to extract audio for buffer_size seconds
-                    process = (
-                        ffmpeg
-                        .input(self.stream_url, t=self.buffer_size)
-                        .output(chunk_file, acodec='pcm_s16le', ar=16000, ac=1, loglevel='error')
-                        .overwrite_output()
-                        .run_async(pipe_stdout=True, pipe_stderr=True)
-                    )
+                    # Use ffmpeg directly via subprocess instead of the Python wrapper
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y", "-i", self.stream_url, 
+                        "-t", str(self.buffer_size),
+                        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                        "-loglevel", "error",
+                        chunk_file
+                    ]
                     
-                    # Wait for the process to complete
-                    stdout, stderr = process.communicate()
+                    # Run ffmpeg process
+                    process = subprocess.run(
+                        ffmpeg_cmd, 
+                        capture_output=True, 
+                        text=True,
+                        check=False
+                    )
                     
                     # If the file was created successfully, add it to the queue
                     if os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 0:
@@ -238,6 +243,8 @@ class LiveStreamTranscriber:
                         self.audio_queue.put(audio)
                     else:
                         logger.warning("Failed to capture audio chunk, retrying...")
+                        if process.stderr:
+                            logger.debug(f"FFmpeg error: {process.stderr}")
                         time.sleep(1)
                         
                 except Exception as e:
@@ -329,6 +336,10 @@ class LiveStreamTranscriber:
                     f.write(entry + "\n")
             
             logger.info(f"Wrote {len(self.transcription)} new transcription entries to {self.output_path}")
+            
+            # Clear the list of transcribed entries that have been written
+            self.transcription = []
+            
         except Exception as e:
             logger.error(f"Error writing transcription to file: {e}")
     
