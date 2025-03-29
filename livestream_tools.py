@@ -195,11 +195,12 @@ class LiveStreamTranscriber:
     def __init__(self, 
                  stream_url: str, 
                  output_path: Optional[str] = None,
-                 buffer_size: int = 4,  # seconds - reduced from 10
-                 min_buffer_size: int = 2,  # seconds - reduced from 5
-                 max_buffer_size: int = 8,  # seconds - reduced from 20
-                 overlap_ratio: float = 0.25,  # overlap between consecutive chunks - reduced from 0.5 
-                 output_interval: int = 10):  # seconds - reduced from 30
+                 buffer_size: int = 2,  # seconds - reduced from 4
+                 min_buffer_size: int = 1,  # seconds - reduced from 2
+                 max_buffer_size: int = 4,  # seconds - reduced from 8
+                 overlap_ratio: float = 0.15,  # overlap between consecutive chunks - reduced from 0.25 
+                 output_interval: int = 5,  # seconds - reduced from 10
+                 max_queue_size: int = 20):  # maximum audio chunks in queue
         """Initialize the live stream transcriber.
         
         Args:
@@ -223,12 +224,23 @@ class LiveStreamTranscriber:
         self.last_successful_position = 0  # Last position that produced good transcription
         self.position_history = []  # Keep track of recent positions
         
+        # Queue management
+        self.max_queue_size = max_queue_size
+        self.backpressure_applied = False
+        
         # Performance tracking
         self.transcription_success_count = 0
         self.transcription_attempt_count = 0
         self.consecutive_empty = 0
         self.consecutive_repeats = 0
         self.consecutive_failures = 0
+        self.performance_metrics = {
+            'processing_times': [],
+            'queue_sizes': [],
+            'resync_events': 0,
+            'duplicate_skips': 0,
+            'backpressure_events': 0
+        }
         self.adaptive_stats = {
             'buffer_adjustments': 0,
             'successful_resyncs': 0,
@@ -267,7 +279,7 @@ class LiveStreamTranscriber:
         self.last_transcription_time = time.time()
         
     def _is_duplicate_text(self, text: str) -> bool:
-        """Check if text is a duplicate of recently transcribed text.
+        """Check if text is a duplicate of recently transcribed text using improved fuzzy matching.
         
         Args:
             text: The transcribed text to check
@@ -275,35 +287,82 @@ class LiveStreamTranscriber:
         Returns:
             True if the text is a duplicate, False otherwise
         """
-        # Create a hash of the text for efficient comparison
-        text_hash = hash(text.lower().strip())
+        # Skip very short texts as they're often false positives for duplicates
+        normalized_text = text.lower().strip()
+        if len(normalized_text) < 5:  # Increased from potentially 0 to minimum 5 chars
+            return False
+            
+        # Create a hash of the text for exact match comparison
+        text_hash = hash(normalized_text)
         
-        # Check if we've seen this exact text before
+        # Check if we've seen this exact text before (exact match)
         if text_hash in self.seen_text_hashes:
+            self.performance_metrics['duplicate_skips'] += 1
             return True
             
-        # Check for substrings of recent transcripts
+        # Calculate word-level fingerprint for fuzzy matching
+        text_words = normalized_text.split()
+        word_count = len(text_words)
+        
+        # Skip further checking if text is too short (less than 3 words)
+        if word_count < 3:
+            self.seen_text_hashes.add(text_hash)
+            self.recent_transcripts.append(normalized_text)
+            return False
+            
+        # Check for substrings and fuzzy matches in recent transcripts
         for recent in self.recent_transcripts:
-            # If this text is completely contained in a recent transcript, it's a duplicate
-            if text.lower().strip() in recent.lower():
+            recent_normalized = recent.lower().strip()
+            
+            # Full substring check (if this text is completely contained in a recent transcript)
+            if normalized_text in recent_normalized:
+                self.performance_metrics['duplicate_skips'] += 1
                 return True
                 
-            # Check for significant overlap (more than 80% of words)
-            text_words = set(text.lower().split())
-            recent_words = set(recent.lower().split())
-            if text_words and recent_words:
-                overlap = len(text_words.intersection(recent_words))
-                if overlap / len(text_words) > 0.8:
+            # Sliding window check for partial matches
+            # This catches cases where the new text overlaps with the end of a previous text
+            recent_words = recent_normalized.split()
+            
+            # Compare using word n-grams for more robust matching
+            if len(text_words) >= 3 and len(recent_words) >= 3:
+                # Create sets of 3-word phrases (trigrams) from each text
+                text_trigrams = set()
+                for i in range(len(text_words) - 2):
+                    text_trigrams.add(" ".join(text_words[i:i+3]))
+                    
+                recent_trigrams = set()
+                for i in range(len(recent_words) - 2):
+                    recent_trigrams.add(" ".join(recent_words[i:i+3]))
+                
+                # If there's significant trigram overlap, it's likely a duplicate
+                if text_trigrams and recent_trigrams:
+                    common_trigrams = text_trigrams.intersection(recent_trigrams)
+                    # More strict threshold - needs 40% of trigrams to match
+                    if len(common_trigrams) >= 0.4 * len(text_trigrams):
+                        self.performance_metrics['duplicate_skips'] += 1
+                        return True
+                
+            # Check for significant word overlap (more than 75% of words - reduced from 80%)
+            recent_word_set = set(recent_words)
+            text_word_set = set(text_words)
+            
+            if text_word_set and recent_word_set:
+                overlap = len(text_word_set.intersection(recent_word_set))
+                shorter_len = min(len(text_word_set), len(recent_word_set))
+                
+                # If 75% of words in the shorter text are in the longer text, likely duplicate
+                if overlap / shorter_len > 0.75:
+                    self.performance_metrics['duplicate_skips'] += 1
                     return True
         
         # Not a duplicate, add to our seen text
         self.seen_text_hashes.add(text_hash)
-        self.recent_transcripts.append(text)
+        self.recent_transcripts.append(normalized_text)
         
         # Keep the recent transcripts list at a reasonable size
         if len(self.recent_transcripts) > self.max_recent_transcripts:
             old_text = self.recent_transcripts.pop(0)
-            # Try to remove the hash for the old text (may not exist if it was filtered earlier)
+            # Remove the hash for the old text
             old_hash = hash(old_text.lower().strip())
             self.seen_text_hashes.discard(old_hash)
             
@@ -467,12 +526,17 @@ class LiveStreamTranscriber:
                     if len(self.position_history) > 10:
                         self.position_history.pop(0)
                     
-                    # Transcribe the audio
+                    # Submit the audio file for parallel transcription
+                    self.batch_queue.put((temp_path, metadata))
+                    
+                    # Try to transcribe using the main process while waiting for workers
                     with sr.AudioFile(temp_path) as source:
                         audio_data = self.recognizer.record(source)
                         try:
                             # Using Google Speech Recognition
                             text = self.recognizer.recognize_google(audio_data)
+                            
+                            # Process the transcription result
                             if text and len(text.strip()) > 0:
                                 # Check if this is duplicate text using our new method
                                 if self._is_duplicate_text(text):
@@ -487,6 +551,14 @@ class LiveStreamTranscriber:
                                         
                                     # Skip adding this duplicate text 
                                     self.audio_queue.task_done()
+                                    
+                                    # Clean up worker queue entry for this chunk if it exists
+                                    try:
+                                        while not self.results_queue.empty():
+                                            self.results_queue.get_nowait()
+                                            self.results_queue.task_done()
+                                    except queue.Empty:
+                                        pass
                                     continue
                                 else:
                                     # New unique text, reset counters and update success metrics
@@ -559,7 +631,12 @@ class LiveStreamTranscriber:
                     # Mark the task as done
                     self.audio_queue.task_done()
                     
+                    # Actively check for results from worker threads even if we already got our own results
+                    self._check_worker_results()
+                    
                 except queue.Empty:
+                    # Still check for worker results even during quiet periods
+                    self._check_worker_results()
                     # Check if we haven't had a transcription in a while (reduced from 30 to 15 seconds)
                     if time.time() - self.last_transcription_time > 15:
                         logger.debug("No transcription for 15 seconds, attempting to resync")
@@ -665,6 +742,130 @@ class LiveStreamTranscriber:
         except Exception as e:
             logger.error(f"Error writing transcription to file: {e}")
     
+    def _manage_backpressure(self):
+        """Manage backpressure to prevent queue overflow."""
+        while self.is_running:
+            try:
+                current_size = self.audio_queue.qsize()
+                self.performance_metrics['queue_sizes'].append(current_size)
+                
+                # Trim the queue sizes list to avoid memory issues
+                if len(self.performance_metrics['queue_sizes']) > 100:
+                    self.performance_metrics['queue_sizes'] = self.performance_metrics['queue_sizes'][-100:]
+                
+                # If queue is getting too full, apply backpressure by increasing stream position
+                if current_size >= self.max_queue_size:
+                    if not self.backpressure_applied:
+                        logger.debug(f"Applying backpressure: queue size {current_size} >= max {self.max_queue_size}")
+                        # Jump ahead to reduce pressure on the processing pipeline
+                        self.stream_position += self.buffer_size * 2
+                        logger.debug(f"Backpressure applied: jumped to position {self.stream_position}s")
+                        self.backpressure_applied = True
+                        self.performance_metrics['backpressure_events'] += 1
+                elif current_size < self.max_queue_size // 2:
+                    # Reset backpressure flag when queue is less than half full
+                    if self.backpressure_applied:
+                        logger.debug("Backpressure released: queue size reduced")
+                        self.backpressure_applied = False
+                
+                # Track performance analytics
+                if len(self.performance_metrics['queue_sizes']) > 10:
+                    avg_queue_size = sum(self.performance_metrics['queue_sizes'][-10:]) / 10
+                    if avg_queue_size > self.max_queue_size * 0.8 and self.overlap_ratio > 0.05:
+                        # If we're consistently close to max queue size, reduce overlap ratio
+                        old_overlap = self.overlap_ratio
+                        self.overlap_ratio = max(0.05, self.overlap_ratio - 0.05)
+                        logger.debug(f"High queue load: reduced overlap ratio from {old_overlap:.2f} to {self.overlap_ratio:.2f}")
+                
+                # Sleep for a short time before checking again
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error in backpressure management: {e}")
+                time.sleep(1)
+                
+    def _check_worker_results(self):
+        """Check for and process results from worker threads."""
+        try:
+            # Process as many results as are available without blocking
+            while True:
+                try:
+                    # Try to get a result with a very short timeout
+                    text, metadata, audio_path = self.results_queue.get_nowait()
+                    
+                    # Process valid transcription
+                    if text and len(text.strip()) > 0:
+                        # Check if this is duplicate text
+                        if not self._is_duplicate_text(text):
+                            # New unique text
+                            # Update transcription time
+                            self.last_transcription_time = time.time()
+                            self.last_successful_position = metadata['start_position']
+                            
+                            # Create timestamped entry for file output
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                            transcription_entry = f"[{timestamp}] {text}"
+                            
+                            # Only output unique content
+                            if not VERBOSE_OUTPUT:
+                                # Just show the plain text without timestamp or prefix
+                                transcript_logger.info(f"[WORKER] {text}")
+                            else:
+                                # Show full debug info
+                                logger.info(f"Worker transcribed: {transcription_entry}")
+                            
+                            # Add to transcription list with timestamp for file output
+                            self.transcription.append(transcription_entry)
+                            self.transcription_success_count += 1
+                    
+                    # Mark the task as done
+                    self.results_queue.task_done()
+                    
+                except queue.Empty:
+                    # No more results available, break out of the loop
+                    break
+        except Exception as e:
+            logger.error(f"Error checking worker results: {e}")
+    
+    def _parallel_transcribe(self, batch_queue, results_queue):
+        """Transcribe audio in parallel worker thread."""
+        worker_recognizer = sr.Recognizer()
+        
+        while self.is_running:
+            try:
+                # Get the next item to process
+                item = batch_queue.get(timeout=3)
+                if item is None:  # Sentinel value to indicate shutdown
+                    batch_queue.task_done()
+                    break
+                    
+                audio_path, metadata = item
+                
+                try:
+                    with sr.AudioFile(audio_path) as source:
+                        audio_data = worker_recognizer.record(source)
+                        text = worker_recognizer.recognize_google(audio_data)
+                        
+                    # Put the result in the results queue
+                    results_queue.put((text, metadata, audio_path))
+                except sr.UnknownValueError:
+                    # No text detected
+                    results_queue.put((None, metadata, audio_path))
+                except sr.RequestError as e:
+                    logger.error(f"API error in worker thread: {e}")
+                    results_queue.put((None, metadata, audio_path))
+                except Exception as e:
+                    logger.error(f"Error in worker thread: {e}")
+                    results_queue.put((None, metadata, audio_path))
+                    
+                batch_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error in worker thread: {e}")
+                time.sleep(0.5)
+    
     def start(self) -> bool:
         """Start the live stream transcription process.
         
@@ -695,6 +896,10 @@ class LiveStreamTranscriber:
             self.is_running = False
             return False
         
+        # Setup thread communication queues
+        self.batch_queue = queue.Queue()
+        self.results_queue = queue.Queue()
+        
         # Start audio streaming thread
         stream_thread = threading.Thread(target=self._stream_audio)
         stream_thread.daemon = True
@@ -707,7 +912,24 @@ class LiveStreamTranscriber:
         process_thread.start()
         self.threads.append(process_thread)
         
-        logger.info("Transcription process started")
+        # Start backpressure management thread
+        backpressure_thread = threading.Thread(target=self._manage_backpressure)
+        backpressure_thread.daemon = True
+        backpressure_thread.start()
+        self.threads.append(backpressure_thread)
+        
+        # Start parallel transcription worker threads
+        num_workers = min(4, os.cpu_count() or 2)  # Use up to 4 workers or CPU count
+        for i in range(num_workers):
+            worker = threading.Thread(
+                target=self._parallel_transcribe, 
+                args=(self.batch_queue, self.results_queue)
+            )
+            worker.daemon = True
+            worker.start()
+            self.threads.append(worker)
+            
+        logger.info(f"Transcription process started with {num_workers} parallel workers")
         return True
     
     def stop(self) -> None:
@@ -742,12 +964,13 @@ def transcribe_live_stream(
     video_url: str, 
     output_path: Optional[str] = None,
     format: str = "best",
-    buffer_size: int = 4,  # Reduced from 10s
-    min_buffer_size: int = 2,  # Reduced from 5s
-    max_buffer_size: int = 8,  # Reduced from 20s
-    overlap_ratio: float = 0.25,  # Reduced from 0.5
-    output_interval: int = 10,  # Reduced from 30s
-    duration: Optional[int] = None
+    buffer_size: int = 2,  # Reduced from 4s for faster sampling
+    min_buffer_size: int = 1,  # Reduced from 2s for faster adaptation
+    max_buffer_size: int = 4,  # Reduced from 8s
+    overlap_ratio: float = 0.15,  # Reduced from 0.25 for less duplication
+    output_interval: int = 5,  # Reduced from 10s for more frequent updates
+    duration: Optional[int] = None,
+    max_queue_size: int = 20  # Control queue backpressure
 ) -> Optional[str]:
     """Connect to a YouTube live stream and transcribe it in real-time.
     
@@ -785,7 +1008,8 @@ def transcribe_live_stream(
         min_buffer_size=min_buffer_size,
         max_buffer_size=max_buffer_size,
         overlap_ratio=overlap_ratio,
-        output_interval=output_interval
+        output_interval=output_interval,
+        max_queue_size=max_queue_size
     )
     
     if not transcriber.start():
@@ -856,24 +1080,28 @@ def main() -> int:
     
     # Add buffer and adaptive sizing parameters
     transcribe_parser.add_argument(
-        '--buffer-size', '-b', type=int, default=4,
-        help='Initial size of audio buffer in seconds (default: 4)'
+        '--buffer-size', '-b', type=int, default=2,
+        help='Initial size of audio buffer in seconds (default: 2)'
     )
     transcribe_parser.add_argument(
-        '--min-buffer-size', type=int, default=2,
-        help='Minimum buffer size for adaptive sizing in seconds (default: 2)'
+        '--min-buffer-size', type=int, default=1,
+        help='Minimum buffer size for adaptive sizing in seconds (default: 1)'
     )
     transcribe_parser.add_argument(
-        '--max-buffer-size', type=int, default=8,
-        help='Maximum buffer size for adaptive sizing in seconds (default: 8)'
+        '--max-buffer-size', type=int, default=4,
+        help='Maximum buffer size for adaptive sizing in seconds (default: 4)'
     )
     transcribe_parser.add_argument(
-        '--overlap-ratio', type=float, default=0.25,
-        help='Ratio of overlap between consecutive chunks (default: 0.25)'
+        '--overlap-ratio', type=float, default=0.15,
+        help='Ratio of overlap between consecutive chunks (default: 0.15)'
     )
     transcribe_parser.add_argument(
-        '--output-interval', '-i', type=int, default=10,
-        help='How often to write transcript to file in seconds (default: 10)'
+        '--output-interval', '-i', type=int, default=5,
+        help='How often to write transcript to file in seconds (default: 5)'
+    )
+    transcribe_parser.add_argument(
+        '--max-queue-size', type=int, default=20,
+        help='Maximum size of the audio processing queue (default: 20)'
     )
     transcribe_parser.add_argument(
         '--duration', '-d', type=int,
@@ -923,7 +1151,8 @@ def main() -> int:
             max_buffer_size=args.max_buffer_size,
             overlap_ratio=args.overlap_ratio,
             output_interval=args.output_interval,
-            duration=args.duration
+            duration=args.duration,
+            max_queue_size=args.max_queue_size
         )
         
         if transcript_path:
