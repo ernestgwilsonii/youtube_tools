@@ -27,13 +27,40 @@ import yt_dlp
 import speech_recognition as sr
 from pydub import AudioSegment
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# Configure main logger for operational logs
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)  # Default to WARNING level to reduce noise
+
+# Create a special logger just for transcriptions
+transcript_logger = logging.getLogger("transcript")
+transcript_logger.setLevel(logging.INFO)
+
+# Add handlers with formatters
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(message)s"))  # Simple format for transcript output
+transcript_logger.addHandler(console_handler)
+
+debug_handler = logging.StreamHandler()
+debug_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", 
+                                            "%Y-%m-%d %H:%M:%S"))
+logger.addHandler(debug_handler)
+
+# Global verbosity flag
+VERBOSE_OUTPUT = False
+
+def configure_logging(verbose=False):
+    """Configure logging based on verbosity level.
+    
+    Args:
+        verbose: If True, enable detailed logging
+    """
+    global VERBOSE_OUTPUT
+    VERBOSE_OUTPUT = verbose
+    
+    if verbose:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
 
 
 def ensure_directory_exists(directory: str) -> None:
@@ -365,11 +392,19 @@ class LiveStreamTranscriber:
                                 # Update transcription time
                                 self.last_transcription_time = time.time()
                                 
+                                # Create timestamped entry for file output
                                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                                 transcription_entry = f"[{timestamp}] {text}"
-                                logger.info(f"Transcribed: {transcription_entry}")
                                 
-                                # Add to transcription list with timestamp
+                                # For console display, use the appropriate logger based on verbosity
+                                if not VERBOSE_OUTPUT:
+                                    # Just show the plain text without timestamp or prefix
+                                    transcript_logger.info(text)
+                                else:
+                                    # Show full debug info
+                                    logger.info(f"Transcribed: {transcription_entry}")
+                                
+                                # Add to transcription list with timestamp for file output
                                 self.transcription.append(transcription_entry)
                                 
                                 # Write to file periodically
@@ -677,6 +712,10 @@ def main() -> int:
         '--duration', '-d', type=int,
         help='How long to transcribe for in seconds (default: runs until stopped)'
     )
+    transcribe_parser.add_argument(
+        '--verbose', '-v', action='store_true',
+        help='Enable verbose output with debugging information (default: False)'
+    )
     
     args = parser.parse_args()
     
@@ -700,6 +739,14 @@ def main() -> int:
             return 1
     
     elif args.command == 'transcribe':
+        # Configure logging based on verbose flag
+        configure_logging(verbose=getattr(args, 'verbose', False))
+        
+        # If not in verbose mode, show a simple starting message
+        if not VERBOSE_OUTPUT:
+            print("Starting transcription... Press Ctrl+C to stop")
+            print("---------------------------------------------")
+        
         transcript_path = transcribe_live_stream(
             video_url=args.url,
             output_path=args.output,

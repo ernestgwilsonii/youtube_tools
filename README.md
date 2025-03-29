@@ -249,6 +249,9 @@ python livestream_tools.py list --order viewCount
 # Connect to a live stream and transcribe in real-time
 python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id"
 
+# Connect to a live stream and transcribe in real-time verbose logging
+python livestream_tools.py transcribe -v "https://www.youtube.com/watch?v=live_video_id"
+
 # Specify output path for transcript
 python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id" \
     --output "downloads/live_transcript.txt"
