@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 yt-dlp Demo Script
 
@@ -8,61 +9,101 @@ Run this file with 'python download_demo.py' after activating the virtual enviro
 import os
 import sys
 import argparse
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Any, Union, List
+
 from yt_dlp import YoutubeDL
 
-def download_video(url, output_format='mp4', quality='best', audio_only=False):
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+
+def ensure_directory_exists(directory: str) -> None:
+    """Ensure that a directory exists, creating it if necessary.
+    
+    Args:
+        directory: Path to the directory to ensure exists.
     """
-    Download a video using yt-dlp.
+    Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+def download_video(
+    url: str, 
+    output_format: str = 'mp4', 
+    quality: str = 'best', 
+    audio_only: bool = False
+) -> bool:
+    """Download a video using yt-dlp.
     
     Args:
         url: URL of the video to download
         output_format: Format of the output file (default: mp4)
         quality: Quality of the video (default: best)
         audio_only: Whether to download only audio (default: False)
+        
+    Returns:
+        bool: True if download succeeded, False otherwise
     """
     # Create downloads directory if it doesn't exist
-    if not os.path.exists('downloads'):
-        os.makedirs('downloads')
+    downloads_dir = os.path.join(os.getcwd(), 'downloads')
+    ensure_directory_exists(downloads_dir)
     
     # Configure yt-dlp options
     if audio_only:
-        ydl_opts = {
+        ydl_opts: Dict[str, Any] = {
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'outtmpl': 'downloads/%(title)s.%(ext)s',
-            'verbose': True
+            'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
+            'verbose': False
         }
     else:
-        ydl_opts = {
+        ydl_opts: Dict[str, Any] = {
             'format': f'{quality}[ext={output_format}]/best[ext={output_format}]/best',
-            'outtmpl': 'downloads/%(title)s.%(ext)s',
-            'verbose': True
+            'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
+            'verbose': False
         }
     
     # Execute download
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            print(f"Downloaded: {info.get('title', 'Video')}")
+            logger.info(f"Downloaded: {info.get('title', 'Video')}")
     except Exception as e:
-        print(f"Error downloading video: {e}")
+        logger.error(f"Error downloading video: {e}")
         return False
     
     return True
 
-def list_formats(url):
-    """List all available formats for a video."""
-    ydl_opts = {
+
+def list_formats(url: str) -> None:
+    """List all available formats for a video.
+    
+    Args:
+        url: URL of the video to list formats for
+    """
+    ydl_opts: Dict[str, Any] = {
         'listformats': True,
     }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.extract_info(url, download=False)
 
-def main():
+
+def main() -> int:
+    """Main entry point for the command line interface.
+    
+    Returns:
+        Exit code (0 for success, non-zero for errors)
+    """
     parser = argparse.ArgumentParser(description='Download videos using yt-dlp')
     parser.add_argument('url', help='URL of the video to download')
     parser.add_argument('--audio-only', '-a', action='store_true', help='Download audio only')
@@ -74,12 +115,16 @@ def main():
     
     if args.list:
         list_formats(args.url)
+        return 0
     else:
         success = download_video(args.url, args.format, args.quality, args.audio_only)
         if success:
-            print("Download completed successfully!")
+            logger.info("Download completed successfully!")
+            return 0
         else:
-            print("Download failed. Check the error messages above.")
+            logger.error("Download failed. Check the error messages above.")
+            return 1
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

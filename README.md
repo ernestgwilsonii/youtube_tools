@@ -1,4 +1,4 @@
-7# YouTube Tools - Video Download, Format Conversion, and Transcription
+# YouTube Tools - Video Download, Format Conversion, and Transcription
 
 This project provides a comprehensive toolset for interacting with YouTube content:
 
