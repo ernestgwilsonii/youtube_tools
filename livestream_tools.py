@@ -182,6 +182,10 @@ class LiveStreamTranscriber:
         self.buffer_size = buffer_size
         self.output_interval = output_interval
         
+        # Add stream position tracking
+        self.stream_position = 0  # Track position in the stream in seconds
+        self.last_successful_position = 0  # Last position that produced good transcription
+        
         # Create downloads directory if it doesn't exist
         downloads_dir = os.path.join(os.getcwd(), 'downloads')
         ensure_directory_exists(downloads_dir)
@@ -206,6 +210,7 @@ class LiveStreamTranscriber:
         self.threads = []
         self.transcription = []
         self.last_write_time = time.time()
+        self.last_transcription_time = time.time()
         
     def _stream_audio(self):
         """Stream audio from the live stream URL and queue chunks for processing."""
@@ -219,34 +224,75 @@ class LiveStreamTranscriber:
             while self.is_running:
                 # Capture a chunk of audio using ffmpeg
                 try:
-                    # Use ffmpeg directly via subprocess instead of the Python wrapper
+                    # For live streams, we need a special approach that works with HTTP streaming
+                    # and doesn't rely on seeking within the stream
                     ffmpeg_cmd = [
-                        "ffmpeg", "-y", "-i", self.stream_url, 
-                        "-t", str(self.buffer_size),
-                        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                        "-loglevel", "error",
+                        "ffmpeg", "-y",
+                        "-reconnect", "1",  # Reconnect if the connection is lost
+                        "-reconnect_streamed", "1",  # Reconnect if the stream fails
+                        "-reconnect_delay_max", "5",  # Max delay between reconnection attempts
+                        "-i", self.stream_url,
+                        "-t", str(self.buffer_size),  # Duration to capture
+                        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", 
+                        "-loglevel", "warning",
                         chunk_file
                     ]
                     
-                    # Run ffmpeg process
+                    logger.info(f"Capturing audio chunk from stream at position approximately {self.stream_position}s")
+                    
+                    # Run ffmpeg process with a timeout
                     process = subprocess.run(
                         ffmpeg_cmd, 
                         capture_output=True, 
                         text=True,
-                        check=False
+                        check=False,
+                        timeout=self.buffer_size * 2  # Timeout after 2x buffer_size seconds
                     )
                     
                     # If the file was created successfully, add it to the queue
                     if os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 0:
                         # Load the audio file
                         audio = AudioSegment.from_wav(chunk_file)
-                        self.audio_queue.put(audio)
+                        
+                        # Add metadata about which segment of the stream this represents
+                        metadata = {
+                            'start_position': self.stream_position,
+                            'duration': self.buffer_size,
+                            'timestamp': time.time()
+                        }
+                        
+                        # Put both audio and metadata in the queue
+                        self.audio_queue.put((audio, metadata))
+                        
+                        # For live streams, we need to ensure we don't miss content
+                        # Use more aggressive overlapping to ensure continuous coverage
+                        # Use a smaller increment to create more overlap between chunks
+                        position_increment = max(1, self.buffer_size // 4)  # Use 1/4 of buffer or at least 1 second
+                        self.stream_position += position_increment
+                        logger.info(f"Stream position advanced to {self.stream_position} seconds")
+                        
+                        # Reset the consecutive empty counter if we got a good chunk
+                        consecutive_empty = 0
                     else:
-                        logger.warning("Failed to capture audio chunk, retrying...")
+                        logger.warning(f"Failed to capture audio chunk: file empty or not created")
+                        
+                        # If we failed to get a chunk, log more information
                         if process.stderr:
-                            logger.debug(f"FFmpeg error: {process.stderr}")
+                            logger.info(f"FFmpeg stderr: {process.stderr}")
+                        if process.stdout:
+                            logger.info(f"FFmpeg stdout: {process.stdout}")
+                            
+                        # Use a smaller increment when there's an error
+                        self.stream_position += 0.5
+                        logger.info(f"Advanced stream position by 0.5 seconds due to error")
+                        
+                        # Add a delay before retrying to avoid hammering the server
                         time.sleep(1)
                         
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"FFmpeg process timed out after {self.buffer_size * 2} seconds")
+                    self.stream_position += 1  # Move forward a little bit
+                    time.sleep(1)  # Wait a bit before retrying
                 except Exception as e:
                     logger.error(f"Error capturing audio chunk: {e}")
                     if not self.is_running:
@@ -267,17 +313,26 @@ class LiveStreamTranscriber:
         """Process audio chunks from the queue and perform transcription."""
         try:
             logger.info("Starting audio processing for transcription")
+            last_transcript = ""
+            last_transcript_position = 0
+            consecutive_repeats = 0
+            consecutive_empty = 0
+            no_transcription_counter = 0
             
             while self.is_running:
                 try:
                     # Get an audio chunk from the queue, with a timeout
-                    audio = self.audio_queue.get(timeout=5)
+                    audio, metadata = self.audio_queue.get(timeout=5)
+                    logger.debug(f"Processing chunk from position {metadata['start_position']} (queue size: {self.audio_queue.qsize()})")
                     
                     # Export to a temporary file for Speech Recognition
                     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
                         temp_path = temp_file.name
                         
                     audio.export(temp_path, format="wav")
+                    
+                    # Log information about the segment being processed
+                    logger.debug(f"Processing audio segment from position {metadata['start_position']} to {metadata['start_position'] + metadata['duration']} seconds")
                     
                     # Transcribe the audio
                     with sr.AudioFile(temp_path) as source:
@@ -286,6 +341,30 @@ class LiveStreamTranscriber:
                             # Using Google Speech Recognition
                             text = self.recognizer.recognize_google(audio_data)
                             if text:
+                                # Check for repetition issues
+                                if text == last_transcript and metadata['start_position'] > last_transcript_position:
+                                    consecutive_repeats += 1
+                                    logger.debug(f"Detected repeated transcription ({consecutive_repeats} times): {text}")
+                                    
+                                    # If we've seen the same text too many times, trigger resync
+                                    if consecutive_repeats >= 2:
+                                        logger.warning(f"Detected repeated transcription {consecutive_repeats} times, resynchronizing stream")
+                                        self._resync_stream(last_successful_position=last_transcript_position)
+                                        consecutive_repeats = 0
+                                        # Skip adding this repeated text to the transcript
+                                        self.audio_queue.task_done()
+                                        continue
+                                else:
+                                    # New text, reset the counters
+                                    consecutive_repeats = 0
+                                    consecutive_empty = 0
+                                    last_transcript = text
+                                    last_transcript_position = metadata['start_position']
+                                    self.last_successful_position = metadata['start_position']
+                                
+                                # Update transcription time
+                                self.last_transcription_time = time.time()
+                                
                                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                                 transcription_entry = f"[{timestamp}] {text}"
                                 logger.info(f"Transcribed: {transcription_entry}")
@@ -298,9 +377,27 @@ class LiveStreamTranscriber:
                                 if current_time - self.last_write_time >= self.output_interval:
                                     self._write_transcription()
                                     self.last_write_time = current_time
+                            else:
+                                consecutive_empty += 1
+                                logger.debug(f"No text detected in segment (empty count: {consecutive_empty})")
+                                
+                                # If too many consecutive empty segments, we might be in a silent part
+                                if consecutive_empty >= 5:
+                                    logger.info(f"Multiple empty segments detected, may be in silent section. Advancing position.")
+                                    consecutive_empty = 0
+                                    # Advance a bit more to get to new content
+                                    self.stream_position += 5
                                     
                         except sr.UnknownValueError:
                             logger.debug("Speech Recognition could not understand audio")
+                            consecutive_empty += 1
+                            
+                            # If too many consecutive failures to understand, we might need to resync
+                            if consecutive_empty >= 8:
+                                logger.warning(f"Multiple recognition failures, resynchronizing stream")
+                                self._resync_stream()
+                                consecutive_empty = 0
+                                
                         except sr.RequestError as e:
                             logger.error(f"Could not request results from Google Speech Recognition service; {e}")
                     
@@ -314,6 +411,12 @@ class LiveStreamTranscriber:
                     self.audio_queue.task_done()
                     
                 except queue.Empty:
+                    # Check if we haven't had a transcription in a while
+                    if time.time() - self.last_transcription_time > 30:  # 30 seconds without transcription
+                        logger.warning("No transcription for 30 seconds, attempting to resync")
+                        self._resync_stream()
+                        self.last_transcription_time = time.time()  # Reset timer
+                    
                     # No audio in the queue, continue waiting
                     continue
                 except Exception as e:
@@ -322,6 +425,49 @@ class LiveStreamTranscriber:
         except Exception as e:
             logger.error(f"Error in audio processing thread: {e}")
             
+    def _resync_stream(self, last_successful_position=None):
+        """Attempt to resynchronize the stream if we detect issues.
+        
+        Args:
+            last_successful_position: Last stream position that produced good transcription
+        """
+        logger.warning("Attempting to resynchronize stream")
+        
+        previous_position = self.stream_position
+        
+        # Determine the best resyncing strategy
+        if last_successful_position is not None and last_successful_position > 0:
+            # We have a good reference point - try multiple strategies
+            
+            # Strategy 1: Try continuing from the last known good position with a small jump
+            small_jump = 2  # 2 seconds is a small jump
+            new_position = last_successful_position + small_jump
+            logger.info(f"Resync strategy 1: Using last successful position {last_successful_position} + {small_jump}s")
+        else:
+            # No good reference - make a more aggressive jump
+            # This helps if we're stuck in a problematic section of the stream
+            jump_amount = 15  # More aggressive 15 second jump
+            new_position = self.stream_position + jump_amount
+            logger.info(f"Resync strategy: Aggressive jump forward by {jump_amount}s (no good reference point)")
+        
+        # Update stream position
+        self.stream_position = new_position
+        
+        # Clear the audio queue to discard any potentially problematic chunks
+        cleared_chunks = 0
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+                self.audio_queue.task_done()
+                cleared_chunks += 1
+            except queue.Empty:
+                break
+                
+        logger.info(f"Stream resynced from {previous_position}s to {self.stream_position}s (cleared {cleared_chunks} chunks)")
+        
+        # Force an immediate write of current transcriptions to avoid losing data
+        self._write_transcription()
+    
     def _write_transcription(self):
         """Write current transcription to the output file."""
         if not self.transcription:
@@ -358,6 +504,9 @@ class LiveStreamTranscriber:
         
         self.is_running = True
         self.transcription = []
+        self.stream_position = 0  # Reset position when starting
+        self.last_successful_position = 0
+        self.last_transcription_time = time.time()
         
         # Initialize empty output file
         try:
@@ -439,6 +588,9 @@ def transcribe_live_stream(
     if not stream_url:
         logger.error("Failed to get live stream URL")
         return None
+    
+    # Enable more verbose debugging for troubleshooting
+    logger.info(f"Setting up transcription with buffer size: {buffer_size}s and output interval: {output_interval}s")
     
     # Create and start the transcriber
     transcriber = LiveStreamTranscriber(
