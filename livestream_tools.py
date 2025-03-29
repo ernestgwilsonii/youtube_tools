@@ -195,23 +195,50 @@ class LiveStreamTranscriber:
     def __init__(self, 
                  stream_url: str, 
                  output_path: Optional[str] = None,
-                 buffer_size: int = 10,  # seconds
-                 output_interval: int = 30):  # seconds
+                 buffer_size: int = 4,  # seconds - reduced from 10
+                 min_buffer_size: int = 2,  # seconds - reduced from 5
+                 max_buffer_size: int = 8,  # seconds - reduced from 20
+                 overlap_ratio: float = 0.25,  # overlap between consecutive chunks - reduced from 0.5 
+                 output_interval: int = 10):  # seconds - reduced from 30
         """Initialize the live stream transcriber.
         
         Args:
             stream_url: Direct URL to the live stream
             output_path: Path to save the transcript (default: None, generates a filename)
-            buffer_size: Size of audio buffer in seconds (default: 10)
-            output_interval: How often to write transcript to file in seconds (default: 30)
+            buffer_size: Initial size of audio buffer in seconds (default: 4)
+            min_buffer_size: Minimum buffer size in seconds for adaptive sizing (default: 2)
+            max_buffer_size: Maximum buffer size in seconds for adaptive sizing (default: 8)
+            overlap_ratio: Ratio of overlap between consecutive chunks (default: 0.25)
+            output_interval: How often to write transcript to file in seconds (default: 10)
         """
         self.stream_url = stream_url
         self.buffer_size = buffer_size
+        self.min_buffer_size = min_buffer_size
+        self.max_buffer_size = max_buffer_size
+        self.overlap_ratio = overlap_ratio
         self.output_interval = output_interval
         
-        # Add stream position tracking
+        # Add enhanced stream position tracking
         self.stream_position = 0  # Track position in the stream in seconds
         self.last_successful_position = 0  # Last position that produced good transcription
+        self.position_history = []  # Keep track of recent positions
+        
+        # Performance tracking
+        self.transcription_success_count = 0
+        self.transcription_attempt_count = 0
+        self.consecutive_empty = 0
+        self.consecutive_repeats = 0
+        self.consecutive_failures = 0
+        self.adaptive_stats = {
+            'buffer_adjustments': 0,
+            'successful_resyncs': 0,
+            'failed_resyncs': 0
+        }
+        
+        # Text deduplication - store hashes of transcribed text
+        self.seen_text_hashes = set()
+        self.recent_transcripts = []  # Store recent transcriptions to avoid duplicates
+        self.max_recent_transcripts = 20  # Maximum number of recent transcripts to remember
         
         # Create downloads directory if it doesn't exist
         downloads_dir = os.path.join(os.getcwd(), 'downloads')
@@ -239,13 +266,84 @@ class LiveStreamTranscriber:
         self.last_write_time = time.time()
         self.last_transcription_time = time.time()
         
+    def _is_duplicate_text(self, text: str) -> bool:
+        """Check if text is a duplicate of recently transcribed text.
+        
+        Args:
+            text: The transcribed text to check
+            
+        Returns:
+            True if the text is a duplicate, False otherwise
+        """
+        # Create a hash of the text for efficient comparison
+        text_hash = hash(text.lower().strip())
+        
+        # Check if we've seen this exact text before
+        if text_hash in self.seen_text_hashes:
+            return True
+            
+        # Check for substrings of recent transcripts
+        for recent in self.recent_transcripts:
+            # If this text is completely contained in a recent transcript, it's a duplicate
+            if text.lower().strip() in recent.lower():
+                return True
+                
+            # Check for significant overlap (more than 80% of words)
+            text_words = set(text.lower().split())
+            recent_words = set(recent.lower().split())
+            if text_words and recent_words:
+                overlap = len(text_words.intersection(recent_words))
+                if overlap / len(text_words) > 0.8:
+                    return True
+        
+        # Not a duplicate, add to our seen text
+        self.seen_text_hashes.add(text_hash)
+        self.recent_transcripts.append(text)
+        
+        # Keep the recent transcripts list at a reasonable size
+        if len(self.recent_transcripts) > self.max_recent_transcripts:
+            old_text = self.recent_transcripts.pop(0)
+            # Try to remove the hash for the old text (may not exist if it was filtered earlier)
+            old_hash = hash(old_text.lower().strip())
+            self.seen_text_hashes.discard(old_hash)
+            
+        return False
+    
+    def _adjust_buffer_size(self):
+        """Dynamically adjust buffer size based on transcription success rate."""
+        if self.transcription_attempt_count < 3:  # Reduced from 5 for faster adaptation
+            # Not enough data to make a good decision yet
+            return
+            
+        success_rate = self.transcription_success_count / max(1, self.transcription_attempt_count)
+        
+        # Adjust buffer size based on success rate
+        old_buffer_size = self.buffer_size
+        
+        if success_rate > 0.8:  # More aggressive reduction (was 0.9)
+            # High success rate - we can try reducing buffer size for better responsiveness
+            self.buffer_size = max(self.min_buffer_size, self.buffer_size - 1)
+        elif success_rate < 0.7:  # More aggressive increase (was 0.6)
+            # Low success rate - increase buffer size for better recognition
+            self.buffer_size = min(self.max_buffer_size, self.buffer_size + 1)
+            
+        # If buffer size changed, log at debug level
+        if old_buffer_size != self.buffer_size:
+            self.adaptive_stats['buffer_adjustments'] += 1
+            logger.debug(f"Adjusted buffer size from {old_buffer_size}s to {self.buffer_size}s (success rate: {success_rate:.2f})")
+            
+        # Reset counters more frequently to adapt to changing conditions 
+        if self.transcription_attempt_count > 10:  # Was 20
+            self.transcription_success_count = int(self.transcription_success_count * 0.7)  # Less aggressive decay (was 0.5)
+            self.transcription_attempt_count = int(self.transcription_attempt_count * 0.7)  # Less aggressive decay (was 0.5)
+    
     def _stream_audio(self):
         """Stream audio from the live stream URL and queue chunks for processing."""
         temp_dir = tempfile.mkdtemp()
         chunk_file = os.path.join(temp_dir, "chunk.wav")
         
         try:
-            logger.info(f"Starting audio streaming from live stream")
+            logger.debug(f"Starting audio streaming from live stream")
             
             # Use ffmpeg to capture audio from the stream in chunks
             while self.is_running:
@@ -265,7 +363,7 @@ class LiveStreamTranscriber:
                         chunk_file
                     ]
                     
-                    logger.info(f"Capturing audio chunk from stream at position approximately {self.stream_position}s")
+                    logger.debug(f"Capturing audio chunk from stream at position approximately {self.stream_position}s")
                     
                     # Run ffmpeg process with a timeout
                     process = subprocess.run(
@@ -291,33 +389,35 @@ class LiveStreamTranscriber:
                         # Put both audio and metadata in the queue
                         self.audio_queue.put((audio, metadata))
                         
-                        # For live streams, we need to ensure we don't miss content
-                        # Use more aggressive overlapping to ensure continuous coverage
-                        # Use a smaller increment to create more overlap between chunks
-                        position_increment = max(1, self.buffer_size // 4)  # Use 1/4 of buffer or at least 1 second
+                        # Calculate the increment to advance the stream position
+                        # Use the overlap ratio to determine how much to advance
+                        position_increment = max(1, self.buffer_size * (1 - self.overlap_ratio))
                         self.stream_position += position_increment
-                        logger.info(f"Stream position advanced to {self.stream_position} seconds")
+                        logger.debug(f"Stream position advanced to {self.stream_position} seconds")
+                        
+                        # If we're getting good chunks, dynamically adjust the buffer
+                        self._adjust_buffer_size()
                         
                         # Reset the consecutive empty counter if we got a good chunk
-                        consecutive_empty = 0
+                        self.consecutive_empty = 0
                     else:
-                        logger.warning(f"Failed to capture audio chunk: file empty or not created")
+                        logger.debug(f"Failed to capture audio chunk: file empty or not created")
                         
-                        # If we failed to get a chunk, log more information
+                        # If we failed to get a chunk, log more information at debug level
                         if process.stderr:
-                            logger.info(f"FFmpeg stderr: {process.stderr}")
+                            logger.debug(f"FFmpeg stderr: {process.stderr}")
                         if process.stdout:
-                            logger.info(f"FFmpeg stdout: {process.stdout}")
+                            logger.debug(f"FFmpeg stdout: {process.stdout}")
                             
                         # Use a smaller increment when there's an error
                         self.stream_position += 0.5
-                        logger.info(f"Advanced stream position by 0.5 seconds due to error")
+                        logger.debug(f"Advanced stream position by 0.5 seconds due to error")
                         
                         # Add a delay before retrying to avoid hammering the server
                         time.sleep(1)
                         
                 except subprocess.TimeoutExpired:
-                    logger.warning(f"FFmpeg process timed out after {self.buffer_size * 2} seconds")
+                    logger.debug(f"FFmpeg process timed out after {self.buffer_size * 2} seconds")
                     self.stream_position += 1  # Move forward a little bit
                     time.sleep(1)  # Wait a bit before retrying
                 except Exception as e:
@@ -339,17 +439,14 @@ class LiveStreamTranscriber:
     def _process_audio(self):
         """Process audio chunks from the queue and perform transcription."""
         try:
-            logger.info("Starting audio processing for transcription")
+            logger.debug("Starting audio processing for transcription")
             last_transcript = ""
             last_transcript_position = 0
-            consecutive_repeats = 0
-            consecutive_empty = 0
-            no_transcription_counter = 0
             
             while self.is_running:
                 try:
                     # Get an audio chunk from the queue, with a timeout
-                    audio, metadata = self.audio_queue.get(timeout=5)
+                    audio, metadata = self.audio_queue.get(timeout=3)  # Reduced timeout for responsiveness
                     logger.debug(f"Processing chunk from position {metadata['start_position']} (queue size: {self.audio_queue.qsize()})")
                     
                     # Export to a temporary file for Speech Recognition
@@ -358,8 +455,17 @@ class LiveStreamTranscriber:
                         
                     audio.export(temp_path, format="wav")
                     
+                    # Increment attempt counter for adaptive sizing
+                    self.transcription_attempt_count += 1
+                    
                     # Log information about the segment being processed
                     logger.debug(f"Processing audio segment from position {metadata['start_position']} to {metadata['start_position'] + metadata['duration']} seconds")
+                    
+                    # Store current position for tracking
+                    self.position_history.append(metadata['start_position'])
+                    # Keep position history manageable
+                    if len(self.position_history) > 10:
+                        self.position_history.pop(0)
                     
                     # Transcribe the audio
                     with sr.AudioFile(temp_path) as source:
@@ -367,27 +473,30 @@ class LiveStreamTranscriber:
                         try:
                             # Using Google Speech Recognition
                             text = self.recognizer.recognize_google(audio_data)
-                            if text:
-                                # Check for repetition issues
-                                if text == last_transcript and metadata['start_position'] > last_transcript_position:
-                                    consecutive_repeats += 1
-                                    logger.debug(f"Detected repeated transcription ({consecutive_repeats} times): {text}")
+                            if text and len(text.strip()) > 0:
+                                # Check if this is duplicate text using our new method
+                                if self._is_duplicate_text(text):
+                                    self.consecutive_repeats += 1
+                                    logger.debug(f"Detected duplicate text (skipping): {text}")
                                     
-                                    # If we've seen the same text too many times, trigger resync
-                                    if consecutive_repeats >= 2:
-                                        logger.warning(f"Detected repeated transcription {consecutive_repeats} times, resynchronizing stream")
+                                    # If we've seen too many duplicates, trigger resync
+                                    if self.consecutive_repeats >= 2:
+                                        logger.debug(f"Too many duplicates ({self.consecutive_repeats}), resynchronizing stream")
                                         self._resync_stream(last_successful_position=last_transcript_position)
-                                        consecutive_repeats = 0
-                                        # Skip adding this repeated text to the transcript
-                                        self.audio_queue.task_done()
-                                        continue
+                                        self.consecutive_repeats = 0
+                                        
+                                    # Skip adding this duplicate text 
+                                    self.audio_queue.task_done()
+                                    continue
                                 else:
-                                    # New text, reset the counters
-                                    consecutive_repeats = 0
-                                    consecutive_empty = 0
+                                    # New unique text, reset counters and update success metrics
+                                    self.consecutive_repeats = 0
+                                    self.consecutive_empty = 0
+                                    self.consecutive_failures = 0
                                     last_transcript = text
                                     last_transcript_position = metadata['start_position']
                                     self.last_successful_position = metadata['start_position']
+                                    self.transcription_success_count += 1
                                 
                                 # Update transcription time
                                 self.last_transcription_time = time.time()
@@ -396,7 +505,7 @@ class LiveStreamTranscriber:
                                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                                 transcription_entry = f"[{timestamp}] {text}"
                                 
-                                # For console display, use the appropriate logger based on verbosity
+                                # Only output unique content
                                 if not VERBOSE_OUTPUT:
                                     # Just show the plain text without timestamp or prefix
                                     transcript_logger.info(text)
@@ -407,48 +516,53 @@ class LiveStreamTranscriber:
                                 # Add to transcription list with timestamp for file output
                                 self.transcription.append(transcription_entry)
                                 
-                                # Write to file periodically
+                                # Write to file more frequently with smaller buffer
                                 current_time = time.time()
                                 if current_time - self.last_write_time >= self.output_interval:
                                     self._write_transcription()
                                     self.last_write_time = current_time
                             else:
-                                consecutive_empty += 1
-                                logger.debug(f"No text detected in segment (empty count: {consecutive_empty})")
+                                self.consecutive_empty += 1
+                                logger.debug(f"No text detected in segment (empty count: {self.consecutive_empty})")
                                 
                                 # If too many consecutive empty segments, we might be in a silent part
-                                if consecutive_empty >= 5:
-                                    logger.info(f"Multiple empty segments detected, may be in silent section. Advancing position.")
-                                    consecutive_empty = 0
+                                # Reduced from 5 to 3 for faster detection
+                                if self.consecutive_empty >= 3:
+                                    logger.debug(f"Multiple empty segments detected, likely silent section. Advancing position.")
+                                    self.consecutive_empty = 0
                                     # Advance a bit more to get to new content
-                                    self.stream_position += 5
+                                    self.stream_position += self.buffer_size
                                     
                         except sr.UnknownValueError:
                             logger.debug("Speech Recognition could not understand audio")
-                            consecutive_empty += 1
+                            self.consecutive_empty += 1
+                            self.consecutive_failures += 1
                             
-                            # If too many consecutive failures to understand, we might need to resync
-                            if consecutive_empty >= 8:
-                                logger.warning(f"Multiple recognition failures, resynchronizing stream")
+                            # Reduced from 8 to 5 for faster detection of issues
+                            if self.consecutive_failures >= 5:
+                                logger.debug(f"Multiple recognition failures, resynchronizing stream")
                                 self._resync_stream()
-                                consecutive_empty = 0
+                                self.consecutive_empty = 0
                                 
                         except sr.RequestError as e:
                             logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+                            # Add a more aggressive recovery from API errors
+                            logger.debug("Attempting recovery from API error")
+                            self._resync_stream()
                     
                     # Clean up temporary file
                     try:
                         os.unlink(temp_path)
                     except Exception as e:
-                        logger.warning(f"Could not delete temporary file {temp_path}: {e}")
+                        logger.debug(f"Could not delete temporary file {temp_path}: {e}")
                         
                     # Mark the task as done
                     self.audio_queue.task_done()
                     
                 except queue.Empty:
-                    # Check if we haven't had a transcription in a while
-                    if time.time() - self.last_transcription_time > 30:  # 30 seconds without transcription
-                        logger.warning("No transcription for 30 seconds, attempting to resync")
+                    # Check if we haven't had a transcription in a while (reduced from 30 to 15 seconds)
+                    if time.time() - self.last_transcription_time > 15:
+                        logger.debug("No transcription for 15 seconds, attempting to resync")
                         self._resync_stream()
                         self.last_transcription_time = time.time()  # Reset timer
                     
@@ -466,24 +580,40 @@ class LiveStreamTranscriber:
         Args:
             last_successful_position: Last stream position that produced good transcription
         """
-        logger.warning("Attempting to resynchronize stream")
+        # Only log at INFO level if in verbose mode
+        if VERBOSE_OUTPUT:
+            logger.info("Attempting to resynchronize stream")
+        else:
+            logger.debug("Attempting to resynchronize stream")
         
         previous_position = self.stream_position
         
-        # Determine the best resyncing strategy
+        # Determine the best resyncing strategy based on failure patterns
         if last_successful_position is not None and last_successful_position > 0:
-            # We have a good reference point - try multiple strategies
+            # We have a good reference point - use adaptive strategy
             
-            # Strategy 1: Try continuing from the last known good position with a small jump
-            small_jump = 2  # 2 seconds is a small jump
-            new_position = last_successful_position + small_jump
-            logger.info(f"Resync strategy 1: Using last successful position {last_successful_position} + {small_jump}s")
+            # Scale jump size based on how many resyncs we've done recently
+            # This creates a backoff mechanism for persistent issues
+            if self.consecutive_failures < 3:
+                # Small jump first attempt
+                jump_ratio = 0.2  # 20% of buffer size
+            elif self.consecutive_failures < 5:
+                # Medium jump for repeated failures
+                jump_ratio = 0.5  # 50% of buffer size
+            else:
+                # Large jump after many failures
+                jump_ratio = 1.5  # 150% of buffer size
+                
+            jump_amount = max(1, self.buffer_size * jump_ratio)
+            new_position = last_successful_position + jump_amount
+            
+            logger.debug(f"Resync using last successful position {last_successful_position} + {jump_amount:.1f}s jump")
         else:
-            # No good reference - make a more aggressive jump
+            # No good reference - use more aggressive strategy
             # This helps if we're stuck in a problematic section of the stream
-            jump_amount = 15  # More aggressive 15 second jump
+            jump_amount = self.buffer_size * 1.5  # 150% of buffer size
             new_position = self.stream_position + jump_amount
-            logger.info(f"Resync strategy: Aggressive jump forward by {jump_amount}s (no good reference point)")
+            logger.debug(f"Aggressive resync with {jump_amount:.1f}s forward jump (no good reference)")
         
         # Update stream position
         self.stream_position = new_position
@@ -498,7 +628,18 @@ class LiveStreamTranscriber:
             except queue.Empty:
                 break
                 
-        logger.info(f"Stream resynced from {previous_position}s to {self.stream_position}s (cleared {cleared_chunks} chunks)")
+        logger.debug(f"Stream resynced from {previous_position:.1f}s to {self.stream_position:.1f}s (cleared {cleared_chunks} chunks)")
+        
+        # Adjust buffer size during resync based on failure pattern
+        if self.consecutive_failures > 3:
+            old_buffer = self.buffer_size
+            # Try increasing buffer size to capture more context
+            self.buffer_size = min(self.max_buffer_size, self.buffer_size + 2)
+            if old_buffer != self.buffer_size:
+                logger.debug(f"Increased buffer size from {old_buffer}s to {self.buffer_size}s due to repeated failures")
+        
+        # Track resync statistics
+        self.adaptive_stats['successful_resyncs'] += 1
         
         # Force an immediate write of current transcriptions to avoid losing data
         self._write_transcription()
@@ -601,8 +742,11 @@ def transcribe_live_stream(
     video_url: str, 
     output_path: Optional[str] = None,
     format: str = "best",
-    buffer_size: int = 10,
-    output_interval: int = 30,
+    buffer_size: int = 4,  # Reduced from 10s
+    min_buffer_size: int = 2,  # Reduced from 5s
+    max_buffer_size: int = 8,  # Reduced from 20s
+    overlap_ratio: float = 0.25,  # Reduced from 0.5
+    output_interval: int = 10,  # Reduced from 30s
     duration: Optional[int] = None
 ) -> Optional[str]:
     """Connect to a YouTube live stream and transcribe it in real-time.
@@ -611,7 +755,10 @@ def transcribe_live_stream(
         video_url: YouTube video URL for the live stream
         output_path: Path to save the transcript (default: None, generates a filename)
         format: Format specification for yt-dlp (default: 'best')
-        buffer_size: Size of audio buffer in seconds (default: 10)
+        buffer_size: Initial size of audio buffer in seconds (default: 10)
+        min_buffer_size: Minimum buffer size in seconds for adaptive sizing (default: 5)
+        max_buffer_size: Maximum buffer size in seconds for adaptive sizing (default: 20)
+        overlap_ratio: Ratio of overlap between consecutive chunks (default: 0.5)
         output_interval: How often to write transcript to file in seconds (default: 30)
         duration: How long to transcribe for in seconds (default: None, runs until stopped)
     
@@ -624,14 +771,20 @@ def transcribe_live_stream(
         logger.error("Failed to get live stream URL")
         return None
     
-    # Enable more verbose debugging for troubleshooting
-    logger.info(f"Setting up transcription with buffer size: {buffer_size}s and output interval: {output_interval}s")
+    # Log at debug level unless in verbose mode
+    if VERBOSE_OUTPUT:
+        logger.info(f"Setting up transcription with buffer size: {buffer_size}s and output interval: {output_interval}s")
+    else:
+        logger.debug(f"Setting up transcription with buffer size: {buffer_size}s (min: {min_buffer_size}s, max: {max_buffer_size}s), overlap: {overlap_ratio}")
     
-    # Create and start the transcriber
+    # Create and start the transcriber with all the new parameters
     transcriber = LiveStreamTranscriber(
         stream_url=stream_url,
         output_path=output_path,
         buffer_size=buffer_size,
+        min_buffer_size=min_buffer_size,
+        max_buffer_size=max_buffer_size,
+        overlap_ratio=overlap_ratio,
         output_interval=output_interval
     )
     
@@ -700,13 +853,27 @@ def main() -> int:
         '--format', '-f', default='best',
         help='Format specification for yt-dlp (default: best)'
     )
+    
+    # Add buffer and adaptive sizing parameters
     transcribe_parser.add_argument(
-        '--buffer-size', '-b', type=int, default=10,
-        help='Size of audio buffer in seconds (default: 10)'
+        '--buffer-size', '-b', type=int, default=4,
+        help='Initial size of audio buffer in seconds (default: 4)'
     )
     transcribe_parser.add_argument(
-        '--output-interval', '-i', type=int, default=30,
-        help='How often to write transcript to file in seconds (default: 30)'
+        '--min-buffer-size', type=int, default=2,
+        help='Minimum buffer size for adaptive sizing in seconds (default: 2)'
+    )
+    transcribe_parser.add_argument(
+        '--max-buffer-size', type=int, default=8,
+        help='Maximum buffer size for adaptive sizing in seconds (default: 8)'
+    )
+    transcribe_parser.add_argument(
+        '--overlap-ratio', type=float, default=0.25,
+        help='Ratio of overlap between consecutive chunks (default: 0.25)'
+    )
+    transcribe_parser.add_argument(
+        '--output-interval', '-i', type=int, default=10,
+        help='How often to write transcript to file in seconds (default: 10)'
     )
     transcribe_parser.add_argument(
         '--duration', '-d', type=int,
@@ -752,6 +919,9 @@ def main() -> int:
             output_path=args.output,
             format=args.format,
             buffer_size=args.buffer_size,
+            min_buffer_size=args.min_buffer_size,
+            max_buffer_size=args.max_buffer_size,
+            overlap_ratio=args.overlap_ratio,
             output_interval=args.output_interval,
             duration=args.duration
         )
