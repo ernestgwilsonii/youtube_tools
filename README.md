@@ -7,7 +7,8 @@ This project provides a comprehensive toolset for interacting with YouTube conte
 - **Transcription Generation**: Extract speech-to-text from any video using built-in transcription capabilities
 - **Transcript Download**: Option to download existing YouTube transcriptions when available
 - **Transcript Comparison**: Compare transcriptions from different sources to evaluate quality
-- **Future Feature**: Support for real-time transcription from YouTube live streams
+- **Live Stream Discovery**: Find currently active YouTube live streams based on search criteria
+- **Live Stream Transcription**: Real-time transcription of YouTube live streams as they happen
 
 Built with [yt-dlp](https://github.com/yt-dlp/yt-dlp), this versatile toolkit works across Windows, macOS, and Linux using pure Python, handling both pre-recorded videos and (in future updates) live streams.
 
@@ -226,7 +227,46 @@ python youtube_tools.py compare-transcripts "downloads/youtube_transcript.txt" "
     --output "downloads/transcript_comparison.txt"
 ```
 
-### 8. Getting Help
+### 8. List Live Streams
+
+```bash
+# List popular live streams (default: top 10)
+python livestream_tools.py list
+
+# Search for live streams with a query
+python livestream_tools.py list --query "music concert"
+
+# Adjust number of results
+python livestream_tools.py list --query "gaming" --max-results 5
+
+# Change results order
+python livestream_tools.py list --order viewCount
+```
+
+### 9. Transcribe Live Streams
+
+```bash
+# Connect to a live stream and transcribe in real-time
+python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id"
+
+# Specify output path for transcript
+python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id" \
+    --output "downloads/live_transcript.txt"
+
+# Adjust buffer size for audio processing
+python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id" \
+    --buffer-size 5
+
+# Set how often to write to transcript file (in seconds)
+python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id" \
+    --output-interval 60
+
+# Set a duration to stop transcription after (in seconds)
+python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_video_id" \
+    --duration 600
+```
+
+### 10. Getting Help
 
 ```bash
 # Show all available commands
@@ -372,6 +412,7 @@ youtube_tools/
 ├── youtube_tools.py     # Main Python script with all functionality
 ├── download_demo.py     # Simple demo of video downloading functionality
 ├── video_to_text.py     # Script for transcribing videos to text
+├── livestream_tools.py  # Live stream discovery and real-time transcription
 ├── requirements.txt     # Dependencies
 └── README.md            # This documentation file
 ```
