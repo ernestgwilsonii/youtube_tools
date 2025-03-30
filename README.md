@@ -294,14 +294,55 @@ The `get-clips` command extracts short video clips from a YouTube live stream at
 - The highest resolution video format is used by default
 - The command provides real-time feedback on extraction progress, including clip count and file sizes
 
-### 11. Getting Help
+### 11. Video Analysis with Twelve Labs API
 
 ```bash
-# Show all available commands
+# First, set your Twelve Labs API key as an environment variable
+# On Linux/macOS:
+export TWELVE_LABS_API_KEY=your_api_key
+
+# On Windows:
+set TWELVE_LABS_API_KEY=your_api_key
+
+# Analyze a video file
+python twelve_labs_tools.py get-video-info downloads/clips/1743357070-1743357076.mp4
+
+# Analyze with verbose logging
+python twelve_labs_tools.py get-video-info --verbose downloads/clips/1743357070-1743357076.mp4
+
+# Provide API key directly (useful for one-time operations without setting environment variable)
+python twelve_labs_tools.py get-video-info --api-key your_api_key downloads/clips/1743357070-1743357076.mp4
+```
+
+The `twelve_labs_tools.py` script provides AI-powered video analysis using the Twelve Labs API:
+
+- **get-video-info**: Analyzes a video file and extracts detailed information
+  - Creates an index in Twelve Labs for organizing videos
+  - Uploads and processes the specified video file
+  - Identifies key moments in the video
+  - Generates a summary of the video content
+  - Displays analysis results including duration, key moments and summary
+
+Options:
+- `--verbose, -v`: Enable detailed logging for debugging
+- `--api-key, -k`: Directly specify your Twelve Labs API key (overrides environment variable)
+
+Note: You must have a valid Twelve Labs API key to use this feature. The environment variable approach is recommended for regular use, while the --api-key option is convenient for one-time operations.
+
+### 12. Getting Help
+
+```bash
+# Show all available commands for youtube_tools
 python youtube_tools.py --help
 
 # Show help for a specific command
 python youtube_tools.py download-and-transcribe --help
+
+# Show help for twelve_labs_tools
+python twelve_labs_tools.py --help
+
+# Show help for specific twelve_labs_tools command
+python twelve_labs_tools.py get-video-info --help
 ```
 
 ## Advanced Usage

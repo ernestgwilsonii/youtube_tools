@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+Twelve Labs Tools Launcher
+
+This is a launcher script that forwards all commands to the main twelve_labs_tools.py script.
+This allows the tool to be invoked without specifying the .py extension.
+"""
+
+import os
+import sys
+import runpy
+import argparse
+
+# Get the directory of this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Path to the main script
+main_script = os.path.join(script_dir, "twelve_labs_tools.py")
+
+# Get target script path
+main_script_path = os.path.abspath(main_script)
+
+# Handle special cases and command line arguments
+if len(sys.argv) > 1:
+    # Special handling for help command
+    if sys.argv[1] == '--help' or sys.argv[1] == '-h':
+        print("Twelve Labs Tools - Video Analysis using Twelve Labs API")
+        print("\nUsage:")
+        print("  python twelve_labs_tools get-video-info [options] VIDEO_PATH")
+        print("\nCommands:")
+        print("  get-video-info    Analyze a video file and extract information")
+        print("\nOptions:")
+        print("  --verbose, -v     Enable verbose output with debugging information")
+        print("  --api-key, -k     Specify API key directly (overrides environment variable)")
+        print("  --help, -h        Show this help message")
+        sys.exit(0)
+    
+    # Help for specific command
+    if sys.argv[1] == 'get-video-info' and len(sys.argv) > 2 and (sys.argv[2] == '--help' or sys.argv[2] == '-h'):
+        print("Usage: python twelve_labs_tools get-video-info [options] VIDEO_PATH")
+        print("\nAnalyze a video file and extract information using Twelve Labs API")
+        print("\nOptions:")
+        print("  --verbose, -v     Enable verbose output with debugging information")
+        print("  --api-key, -k     Specify API key directly (overrides environment variable)")
+        print("  --help, -h        Show this help message")
+        sys.exit(0)
+        
+    # Handle direct command execution for get-video-info
+    if sys.argv[1] == 'get-video-info':
+        # Import functions from the main script directly
+        sys.path.insert(0, os.path.dirname(main_script_path))
+        from twelve_labs_tools import get_video_info
+        
+        # Parse arguments manually
+        verbose = False
+        api_key = None
+        video_path = None
+        
+        i = 0
+        args = sys.argv[2:]  # Skip script name and command
+        while i < len(args):
+            arg = args[i]
+            if arg == '--verbose' or arg == '-v':
+                verbose = True
+                i += 1
+            elif arg == '--api-key' or arg == '-k':
+                if i + 1 < len(args):
+                    api_key = args[i + 1]
+                    i += 2
+                else:
+                    print("Error: --api-key requires a value")
+                    sys.exit(1)
+            else:
+                # Assume it's the video path
+                video_path = arg
+                i += 1
+        
+        if video_path:
+            print(f"Processing video: {video_path}")
+            result = get_video_info(video_path, verbose, api_key)
+            sys.exit(0 if result else 1)
+        else:
+            print("Error: Missing video path.")
+            print("Usage: python twelve_labs_tools get-video-info [--verbose] [--api-key KEY] VIDEO_PATH")
+            sys.exit(1)
+
+if os.path.exists(main_script):
+    # Add script directory to path to allow imports
+    sys.path.insert(0, script_dir)
+    
+    # Run the main script with the current arguments
+    runpy.run_path(main_script, run_name="__main__")
+else:
+    print(f"Error: Main script not found at {main_script}")
+    print("Make sure twelve_labs_tools.py is in the same directory as this launcher.")
+    sys.exit(1)

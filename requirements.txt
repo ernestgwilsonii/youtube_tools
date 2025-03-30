@@ -1,3 +1,5 @@
 yt-dlp==2025.03.27
 SpeechRecognition==3.10.0
 pydub==0.25.1
+twelvelabs==1.0.0
+requests==2.30.0
