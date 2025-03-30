@@ -269,7 +269,32 @@ python livestream_tools.py transcribe "https://www.youtube.com/watch?v=live_vide
     --duration 600
 ```
 
-### 10. Getting Help
+### 10. Extract Video Clips from Live Streams
+
+```bash
+# Extract 6-second clips every 60 seconds from a live stream
+python livestream_tools.py get-clips 6 60 "https://www.youtube.com/watch?v=live_video_id"
+
+# Extract 10-second clips every 30 seconds with verbose logging
+python livestream_tools.py get-clips 10 30 "https://www.youtube.com/watch?v=live_video_id" -v
+
+# Specify video format
+python livestream_tools.py get-clips 6 60 "https://www.youtube.com/watch?v=live_video_id" \
+    --format "best[height<=720]"
+
+# Set maximum number of clips to extract before stopping
+python livestream_tools.py get-clips 6 60 "https://www.youtube.com/watch?v=live_video_id" \
+    --max-clips 10
+```
+
+The `get-clips` command extracts short video clips from a YouTube live stream at regular intervals:
+- The first parameter is the duration (in seconds) of each clip
+- The second parameter is the interval (in seconds) between clips
+- Clips are saved to the `downloads/clips` directory with filenames using EPOCH timestamps (e.g., `1616935321-1616935327.mp4`)
+- The highest resolution video format is used by default
+- The command provides real-time feedback on extraction progress, including clip count and file sizes
+
+### 11. Getting Help
 
 ```bash
 # Show all available commands

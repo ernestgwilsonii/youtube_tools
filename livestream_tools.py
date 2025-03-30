@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Live Stream Tools - YouTube Live Stream Discovery, Connection, and Transcription
+Live Stream Tools - YouTube Live Stream Discovery, Connection, Transcription, and Clip Extraction
 
 This script provides functionality to:
 - List available YouTube live streams based on search criteria
 - Connect to YouTube live streams
 - Transcribe YouTube live streams in real-time
+- Extract periodic short clips from YouTube live streams
 
 All downloads and transcripts are saved to a 'downloads' folder within the current directory.
 """
@@ -26,6 +27,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Generator
 import yt_dlp
 import speech_recognition as sr
 from pydub import AudioSegment
+import shutil
 
 # Configure main logger for operational logs
 logger = logging.getLogger(__name__)
@@ -1041,6 +1043,231 @@ def transcribe_live_stream(
     return transcriber.output_path
 
 
+class ClipExtractor:
+    """Class for extracting periodic clips from YouTube live streams."""
+    
+    def __init__(self, 
+                 stream_url: str,
+                 clip_duration: int,
+                 interval: int,
+                 format: str = "best"):
+        """Initialize the clip extractor.
+        
+        Args:
+            stream_url: Direct URL to the live stream
+            clip_duration: Duration of each clip in seconds
+            interval: Interval between clips in seconds
+            format: Format specification for video quality
+        """
+        self.stream_url = stream_url
+        self.clip_duration = clip_duration
+        self.interval = interval
+        self.format = format
+        
+        # Create clips directory if it doesn't exist
+        downloads_dir = os.path.join(os.getcwd(), 'downloads')
+        ensure_directory_exists(downloads_dir)
+        self.clips_dir = os.path.join(downloads_dir, 'clips')
+        ensure_directory_exists(self.clips_dir)
+        
+        # For tracking state
+        self.is_running = False
+        self.threads = []
+        
+        # For tracking clip count
+        self.clip_count = 0
+        
+        # Print setup information
+        print(f"Clip Extractor initialized:")
+        print(f"• Clip duration: {self.clip_duration} seconds")
+        print(f"• Interval between clips: {self.interval} seconds")
+        print(f"• Output directory: {self.clips_dir}")
+    
+    def _extract_clips(self):
+        """Extract clips from the live stream at specified intervals."""
+        try:
+            print(f"Starting clip extraction from YouTube live stream")
+            logger.debug(f"Using stream URL: {self.stream_url}")
+            
+            while self.is_running:
+                try:
+                    # Generate filename with epoch timestamps
+                    start_time = int(time.time())
+                    end_time = start_time + self.clip_duration
+                    filename = f"{start_time}-{end_time}.mp4"
+                    output_path = os.path.join(self.clips_dir, filename)
+                    
+                    print(f"[{time.strftime('%H:%M:%S')}] Extracting clip: {filename}")
+                    
+                    # Use ffmpeg to capture a clip of the specified duration
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y",
+                        "-reconnect", "1",  # Reconnect if the connection is lost
+                        "-reconnect_streamed", "1",  # Reconnect if the stream fails
+                        "-reconnect_delay_max", "5",  # Max delay between reconnection attempts
+                        "-i", self.stream_url,
+                        "-t", str(self.clip_duration),  # Duration to capture
+                        "-c:v", "copy",  # Copy video codec to maintain quality
+                        "-c:a", "copy",  # Copy audio codec to maintain quality
+                        "-loglevel", "warning",
+                        output_path
+                    ]
+                    
+                    # Run ffmpeg process with a timeout
+                    process = subprocess.run(
+                        ffmpeg_cmd, 
+                        capture_output=True, 
+                        text=True,
+                        check=False,
+                        timeout=self.clip_duration * 2  # Timeout after 2x clip_duration seconds
+                    )
+                    
+                    # Verify the clip was created successfully
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        self.clip_count += 1
+                        print(f"[{time.strftime('%H:%M:%S')}] ✓ Clip saved: {filename}")
+                        print(f"  Total clips: {self.clip_count} | Size: {os.path.getsize(output_path) / (1024*1024):.2f} MB")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] ✗ Failed to extract clip: {filename}")
+                        if process.stderr and len(process.stderr) > 0:
+                            print(f"  Error: {process.stderr.strip()}")
+                    
+                    # Wait for the next interval
+                    # We subtract the time it took to capture the clip to maintain regular intervals
+                    elapsed = time.time() - start_time
+                    wait_time = max(0, self.interval - elapsed)
+                    if wait_time > 0:
+                        print(f"Waiting {wait_time:.1f} seconds until next clip...")
+                    time.sleep(wait_time)
+                    
+                except subprocess.TimeoutExpired:
+                    logger.error(f"FFmpeg process timed out after {self.clip_duration * 2} seconds")
+                    time.sleep(1)  # Brief pause before retrying
+                except Exception as e:
+                    logger.error(f"Error extracting clip: {e}")
+                    if not self.is_running:
+                        break
+                    time.sleep(1)  # Brief pause before retrying
+                    
+        except Exception as e:
+            logger.error(f"Error in clip extraction thread: {e}")
+        finally:
+            logger.info("Clip extraction thread stopped")
+    
+    def start(self) -> bool:
+        """Start the clip extraction process.
+        
+        Returns:
+            True if started successfully, False otherwise
+        """
+        if self.is_running:
+            logger.warning("Clip extraction is already running")
+            return False
+        
+        self.is_running = True
+        
+        # Start clip extraction thread
+        extract_thread = threading.Thread(target=self._extract_clips)
+        extract_thread.daemon = True
+        extract_thread.start()
+        self.threads.append(extract_thread)
+        
+        logger.info("Clip extraction process started")
+        return True
+    
+    def stop(self) -> None:
+        """Stop the clip extraction process."""
+        if not self.is_running:
+            logger.warning("Clip extraction is not running")
+            return
+        
+        print("Stopping clip extraction process...")
+        self.is_running = False
+        
+        # Wait for threads to finish
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+        
+        # Final summary
+        print(f"\nClip extraction complete!")
+        print(f"• Total clips extracted: {self.clip_count}")
+        print(f"• Clips saved to: {self.clips_dir}")
+
+
+def extract_clips_from_stream(
+    video_url: str,
+    clip_duration: int,
+    interval: int,
+    format: str = "best",
+    max_clips: Optional[int] = None
+) -> bool:
+    """Extract periodic clips from a YouTube live stream.
+    
+    Args:
+        video_url: YouTube video URL for the live stream
+        clip_duration: Duration of each clip in seconds
+        interval: Interval between clips in seconds
+        format: Format specification for yt-dlp (default: 'best')
+        max_clips: Maximum number of clips to extract (default: None, runs until stopped)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    # Extract the direct streaming URL
+    print(f"\nConnecting to YouTube live stream: {video_url}")
+    stream_url = get_live_stream_url(video_url, format)
+    if not stream_url:
+        print(f"❌ Failed to get live stream URL. Make sure this is a valid live stream.")
+        return False
+    
+    print(f"✓ Successfully connected to live stream")
+    
+    # Create and start the extractor
+    extractor = ClipExtractor(
+        stream_url=stream_url,
+        clip_duration=clip_duration,
+        interval=interval,
+        format=format
+    )
+    
+    if not extractor.start():
+        print("❌ Failed to start clip extraction process")
+        return False
+    
+    try:
+        if max_clips:
+            print(f"Will automatically stop after extracting {max_clips} clips")
+        
+        start_time = time.time()
+        last_report_time = start_time
+        
+        # Run until interrupted or max_clips reached
+        while True:
+            if max_clips and extractor.clip_count >= max_clips:
+                print(f"\nReached specified maximum number of clips: {max_clips}")
+                break
+            
+            # Sleep a bit to avoid hammering the CPU
+            time.sleep(1)
+            
+            # Periodically report status if no clips have been extracted in a while
+            current_time = time.time()
+            if current_time - last_report_time > 30 and extractor.clip_count > 0:
+                print(f"Status: {extractor.clip_count} clips extracted so far. Still running...")
+                last_report_time = current_time
+            
+    except KeyboardInterrupt:
+        logger.info("Clip extraction interrupted by user")
+    except Exception as e:
+        logger.error(f"Error during clip extraction: {e}")
+    finally:
+        # Stop extraction
+        extractor.stop()
+    
+    return True
+
+
 def main() -> int:
     """Main entry point for the command line interface.
     
@@ -1067,6 +1294,27 @@ def main() -> int:
     transcribe_parser = subparsers.add_parser(
         'transcribe', 
         help='Connect to a YouTube live stream and transcribe it in real-time'
+    )
+    
+    # Get clips command
+    get_clips_parser = subparsers.add_parser(
+        'get-clips',
+        help='Extract periodic clips from a YouTube live stream'
+    )
+    get_clips_parser.add_argument('clip_duration', type=int, help='Duration of each clip in seconds')
+    get_clips_parser.add_argument('interval', type=int, help='Interval between clips in seconds')
+    get_clips_parser.add_argument('url', help='URL of the YouTube live stream')
+    get_clips_parser.add_argument(
+        '--format', '-f', default='best',
+        help='Format specification for yt-dlp (default: best)'
+    )
+    get_clips_parser.add_argument(
+        '--max-clips', '-m', type=int,
+        help='Maximum number of clips to extract before stopping (default: runs until stopped)'
+    )
+    get_clips_parser.add_argument(
+        '--verbose', '-v', action='store_true',
+        help='Enable verbose output with debugging information (default: False)'
     )
     transcribe_parser.add_argument('url', help='URL of the YouTube live stream')
     transcribe_parser.add_argument(
@@ -1160,6 +1408,32 @@ def main() -> int:
             return 0
         else:
             logger.error("Failed to transcribe live stream")
+            return 1
+            
+    elif args.command == 'get-clips':
+        # Configure logging based on verbose flag
+        configure_logging(verbose=getattr(args, 'verbose', False))
+        
+        # If not in verbose mode, show a simple starting message
+        if not VERBOSE_OUTPUT:
+            print(f"Starting clip extraction (duration: {args.clip_duration}s, interval: {args.interval}s)...")
+            print("Press Ctrl+C to stop")
+            print("---------------------------------------------")
+        
+        success = extract_clips_from_stream(
+            video_url=args.url,
+            clip_duration=args.clip_duration,
+            interval=args.interval,
+            format=args.format,
+            max_clips=args.max_clips
+        )
+        
+        if success:
+            clips_dir = os.path.join(os.getcwd(), 'downloads', 'clips')
+            logger.info(f"Clip extraction complete! Clips saved to: {clips_dir}")
+            return 0
+        else:
+            logger.error("Failed to extract clips from live stream")
             return 1
     
     else:
